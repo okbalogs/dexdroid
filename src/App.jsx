@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -54,6 +54,11 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
 
+  const [screenCastActive, setScreenCastActive] = useState(false);
+  const [screenCastError, setScreenCastError] = useState("");
+  const [screenCastImage, setScreenCastImage] = useState("");
+  const screenCastRef = useRef({ stream: null, video: null, canvas: null, timer: null });
+
   // BLE scan state (mobile)
   const [bleScanning, setBleScanning] = useState(false);
   const [foundPeer, setFoundPeer] = useState(null);
@@ -104,6 +109,16 @@ export default function App() {
       listen("transfer-complete", ({ payload }) => {
         setSending(false);
         setTimeout(() => clearTransfer(payload.filename), 1200);
+      }),
+
+      listen("screen-cast-frame", ({ payload }) => {
+        if (payload?.data) {
+          setScreenCastImage(`data:image/jpeg;base64,${payload.data}`);
+        }
+      }),
+
+      listen("screen-cast-ended", () => {
+        setScreenCastImage("");
       }),
     ];
 
@@ -194,6 +209,73 @@ export default function App() {
     }
   }
 
+  async function startScreenCast() {
+    setScreenCastError("");
+    if (!peerIp || !peerPort) {
+      setScreenCastError("Please enter a peer IP and port first.");
+      return;
+    }
+    if (!navigator.mediaDevices?.getDisplayMedia) {
+      setScreenCastError("Screen capture is not supported in this environment.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true });
+      const video = document.createElement("video");
+      video.srcObject = stream;
+      video.playsInline = true;
+
+      await new Promise((resolve, reject) => {
+        video.onloadedmetadata = () => resolve(undefined);
+        video.onerror = () => reject(new Error("Unable to prepare screen capture video."));
+      });
+      await video.play();
+
+      const canvas = document.createElement("canvas");
+      canvas.width = video.videoWidth || 1280;
+      canvas.height = video.videoHeight || 720;
+
+      await invoke("start_screen_cast", {
+        peer_ip: peerIp,
+        peer_port: parseInt(peerPort, 10),
+      });
+
+      const captureFrame = async () => {
+        try {
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const dataUrl = canvas.toDataURL("image/jpeg", 0.65);
+          const frameData = dataUrl.split(",")[1];
+          await invoke("send_screen_frame", { frame_data: frameData });
+        } catch (err) {
+          console.error("Screen cast frame error:", err);
+        }
+      };
+
+      const timer = window.setInterval(captureFrame, 500);
+      screenCastRef.current = { stream, video, canvas, timer };
+      setScreenCastActive(true);
+    } catch (e) {
+      setScreenCastError(String(e));
+      await stopScreenCast();
+    }
+  }
+
+  async function stopScreenCast() {
+    const current = screenCastRef.current;
+    if (current.timer) {
+      window.clearInterval(current.timer);
+    }
+    if (current.stream) {
+      current.stream.getTracks().forEach(track => track.stop());
+    }
+    screenCastRef.current = { stream: null, video: null, canvas: null, timer: null };
+    setScreenCastActive(false);
+    await invoke("stop_screen_cast").catch(() => {});
+  }
+
   const activeTransfers = Object.values(transfers);
 
   // ── Render ────────────────────────────────────────────────────────────────────
@@ -278,6 +360,13 @@ export default function App() {
           {activeTransfers.filter(t => t.direction === "receive")
             .map(t => <TransferBar key={t.filename} {...t} />)}
 
+          {screenCastImage && (
+            <section className="screen-cast-view">
+              <h4>Live screen cast</h4>
+              <img src={screenCastImage} alt="Screen cast preview" />
+            </section>
+          )}
+
           {receivedFiles.length > 0 && (
             <section className="history">
               <h4>Received</h4>
@@ -336,9 +425,19 @@ export default function App() {
           </div>
 
           <button className="btn-primary" onClick={handleSend}
-            disabled={!selectedFile || !peerIp || !peerPort || sending}>
+            disabled={!selectedFile || !peerIp || !peerPort || sending || screenCastActive}>
             {sending ? "Sending…" : "Send"}
           </button>
+
+          <button
+            className={`btn-primary ${screenCastActive ? "danger" : "secondary"}`}
+            onClick={screenCastActive ? stopScreenCast : startScreenCast}
+            disabled={!peerIp || !peerPort || sending}
+          >
+            {screenCastActive ? "Stop Screen Cast" : "Start Screen Cast"}
+          </button>
+
+          {screenCastError && <div className="error">{screenCastError}</div>}
 
           {sendError && <div className="error">{sendError}</div>}
 

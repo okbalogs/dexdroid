@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -22,6 +23,14 @@ impl Default for TransferServer {
             shutdown_tx: Mutex::new(None),
             port: Mutex::new(None),
         }
+    }
+}
+
+pub struct ScreenCastClient(AsyncMutex<Option<TcpStream>>);
+
+impl Default for ScreenCastClient {
+    fn default() -> Self {
+        Self(AsyncMutex::new(None))
     }
 }
 
@@ -200,6 +209,23 @@ async fn handle_incoming(mut stream: TcpStream, app: AppHandle) {
         let filename = String::from_utf8(name_buf)?;
         let file_size = stream.read_u64_le().await?;
 
+        if filename == "__SCREENCAST__" {
+            loop {
+                let frame_len = match stream.read_u32_le().await {
+                    Ok(n) => n as usize,
+                    Err(_) => break,
+                };
+                let mut frame = vec![0u8; frame_len];
+                stream.read_exact(&mut frame).await?;
+                let encoded = base64::encode(&frame);
+                let _ = app.emit("screen-cast-frame", serde_json::json!({
+                    "data": encoded,
+                }));
+            }
+            let _ = app.emit("screen-cast-ended", serde_json::json!({}));
+            return Ok(());
+        }
+
         let save_dir = dirs::download_dir()
             .or_else(|| dirs::home_dir())
             .unwrap_or_else(|| PathBuf::from("."));
@@ -315,7 +341,41 @@ async fn send_file(
     }));
     Ok(())
 }
+#[tauri::command]
+async fn start_screen_cast(
+    client: State<'_, ScreenCastClient>,
+    peer_ip: String,
+    peer_port: u16,
+) -> Result<(), String> {
+    let addr = format!("{peer_ip}:{peer_port}");
+    let stream = TcpStream::connect(&addr).await.map_err(|e| e.to_string())?;
+    let mut guard = client.0.lock().await;
+    *guard = Some(stream);
+    Ok(())
+}
 
+#[tauri::command]
+async fn send_screen_frame(
+    client: State<'_, ScreenCastClient>,
+    frame_data: String,
+) -> Result<(), String> {
+    let bytes = base64::decode(&frame_data).map_err(|e| e.to_string())?;
+    let mut guard = client.0.lock().await;
+    let stream = guard.as_mut().ok_or("Screen cast not started")?;
+    stream.write_u32_le(bytes.len() as u32).await.map_err(|e| e.to_string())?;
+    stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
+    stream.flush().await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_screen_cast(client: State<'_, ScreenCastClient>) -> Result<(), String> {
+    let mut guard = client.0.lock().await;
+    if let Some(mut stream) = guard.take() {
+        let _ = stream.shutdown().await;
+    }
+    Ok(())
+}
 // ── Hotspot commands (desktop-only) ──────────────────────────────────────────
 
 #[derive(serde::Serialize, Clone)]
@@ -419,11 +479,15 @@ pub fn run() {
         .manage(TransferServer::default())
         .manage(BleState::default())
         .manage(HotspotState::default())
+        .manage(ScreenCastClient::default())
         .invoke_handler(tauri::generate_handler![
             get_local_ip,
             start_server,
             stop_server,
             send_file,
+            start_screen_cast,
+            send_screen_frame,
+            stop_screen_cast,
             start_hotspot,
             stop_hotspot,
         ])
